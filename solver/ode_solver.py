@@ -59,17 +59,16 @@ class ODESolver:
             sp.Symbol(f"{dep}__d{k}", real=True) for k in range(1, order)
         ]
 
-        # Substitute user-supplied parameter values into the RHS.
+        # Substitute user-supplied parameter values into the RHS. Match by
+        # symbol name so assumptions (real=True vs auto-created) never block it.
         rhs = parsed.rhs_expr
-        subs = {}
-        for name, value in params.items():
-            subs[sp.Symbol(name, real=True)] = value
+        subs = {s: params[s.name] for s in rhs.free_symbols if s.name in params}
         rhs = rhs.subs(subs)
 
         # Any symbol left that isn't the independent var or a state var is an
         # unspecified parameter -> fail clearly rather than silently zeroing it.
-        allowed = {indep, *state_syms}
-        leftover = [s for s in rhs.free_symbols if s not in allowed]
+        allowed_names = {indep.name} | {s.name for s in state_syms}
+        leftover = [s for s in rhs.free_symbols if s.name not in allowed_names]
         if leftover:
             names = ", ".join(sorted(str(s) for s in leftover))
             raise SolverError(
@@ -147,6 +146,7 @@ class ODESolver:
             x=xs,
             y=ys,
             labels=labels,
+            independent=parsed.independent_vars[0],
             method=scipy_method,
             success=True,
             message=message,

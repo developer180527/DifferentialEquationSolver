@@ -61,12 +61,16 @@ class MatplotlibWidget(QWidget):
                 self.axes.plot(x, y[i], label=lbl, linewidth=2 if i == 0 else 1.2,
                                alpha=1.0 if i == 0 else 0.6)
 
-        indep = "x"
+        indep = solution.independent or "x"
         self.axes.set_xlabel(indep)
         self.axes.set_ylabel("value")
         self.axes.grid(True, alpha=0.3)
         self.axes.legend(loc="best", fontsize=9)
         self.canvas.draw()
+
+    # ------------------------------------------------------------------
+    def export_image(self, path: str):
+        self.figure.savefig(path, dpi=150, bbox_inches="tight")
 
     # ------------------------------------------------------------------
     def _plot_pde_slices(self, solution: Solution):

@@ -30,7 +30,7 @@ import re
 
 import sympy as sp
 
-from models.solution import ParsedEquation
+from models.solution import ParsedEquation, ParsedSystem
 
 
 class ParseError(ValueError):
@@ -237,6 +237,137 @@ def quick_classify(text: str) -> str:
     """Best-effort one-line classification for live UI feedback (never raises)."""
 
     try:
-        return parse_equation(text).classification
+        return parse_input(text).classification
     except Exception:
         return "Unknown"
+
+
+# ======================================================================
+# Systems of coupled first-order ODEs
+# ======================================================================
+
+def _parse_system_line(line: str):
+    """Parse one ``d{var}/d{t} = rhs`` (or ``{var}' = rhs``) line.
+
+    Returns ``(state_var, indep_var, rhs_string_canonical)``.
+    """
+
+    canonical, dep, indep, order = _canonicalise(line)
+    if order != 1:
+        raise ParseError(
+            f"System equations must be first order; got order {order} in: {line!r}"
+        )
+    if "=" not in canonical:
+        raise ParseError(f"Missing '=' in: {line!r}")
+
+    lhs_raw, rhs_raw = canonical.split("=", 1)
+    # The LHS must be exactly the first derivative of the state variable.
+    if lhs_raw.strip() != _deriv_symbol(dep, 1):
+        raise ParseError(
+            f"Each system line must be explicit, like dx/dt = ...  (got {line!r})"
+        )
+    return dep, indep[0], rhs_raw
+
+
+def parse_system(text: str) -> ParsedSystem:
+    """Parse a multi-line block of coupled first-order ODEs."""
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and "=" in ln]
+    if len(lines) < 2:
+        raise ParseError("A system needs at least two equations (one per line).")
+
+    state_vars: list[str] = []
+    rhs_raw: list[str] = []
+    indep_var: str | None = None
+
+    for line in lines:
+        dep, indep, rhs = _parse_system_line(line)
+        if dep in state_vars:
+            raise ParseError(f"State variable '{dep}' defined more than once.")
+        if indep_var is None:
+            indep_var = indep
+        elif indep != indep_var:
+            raise ParseError(
+                f"Inconsistent independent variable: '{indep}' vs '{indep_var}'."
+            )
+        state_vars.append(dep)
+        rhs_raw.append(rhs)
+
+    # Build a symbol table covering every state variable + the independent var.
+    table: dict = {sp.Symbol(v, real=True).name: sp.Symbol(v, real=True) for v in state_vars}
+    table[indep_var] = sp.Symbol(indep_var, real=True)
+    for p in ("a", "b", "c", "sigma", "rho", "beta", "alpha", "mu", "omega", "pi", "e"):
+        table.setdefault(p, sp.Symbol(p, real=True))
+    table["pi"] = sp.pi
+    table["e"] = sp.E
+
+    state_syms = [sp.Symbol(v, real=True) for v in state_vars]
+    rhs_exprs = []
+    parameters: set = set()
+    is_linear = True
+
+    for rhs in rhs_raw:
+        try:
+            expr = sp.sympify(rhs, locals=table)
+        except (sp.SympifyError, SyntaxError, TypeError) as exc:
+            raise ParseError(f"Could not parse '{rhs}': {exc}") from exc
+        rhs_exprs.append(expr)
+        # Free parameters = symbols that aren't state vars or the independent var.
+        for s in expr.free_symbols:
+            if s not in state_syms and s != table[indep_var]:
+                parameters.add(str(s))
+        # Linear iff every second partial w.r.t. the state vars vanishes.
+        for i, vi in enumerate(state_syms):
+            for vj in state_syms[i:]:
+                if sp.simplify(sp.diff(expr, vi, vj)) != 0:
+                    is_linear = False
+
+    n = len(state_vars)
+    classification = (
+        f"{'linear' if is_linear else 'nonlinear'} system of "
+        f"{n} coupled first-order ODEs"
+    )
+
+    return ParsedSystem(
+        raw=text,
+        independent_var=indep_var,
+        state_vars=state_vars,
+        rhs_exprs=rhs_exprs,
+        parameters=sorted(parameters),
+        is_linear=is_linear,
+        classification=classification,
+    )
+
+
+def parse_input(text: str):
+    """Top-level entry point: returns a ParsedSystem, or a ParsedEquation.
+
+    Two or more equation lines (each containing '=') are treated as a system;
+    otherwise the input is parsed as a single ODE/PDE.
+    """
+
+    eq_lines = [ln for ln in text.splitlines() if ln.strip() and "=" in ln]
+    if len(eq_lines) >= 2:
+        return parse_system(text)
+    return parse_equation(text)
+
+
+def free_parameters(parsed) -> list[str]:
+    """Parameter names that need user-supplied values, for any parsed object."""
+
+    if isinstance(parsed, ParsedSystem):
+        return list(parsed.parameters)
+
+    if parsed.kind == "PDE":
+        return ["a"]  # diffusivity / wave speed
+
+    # Single ODE: free symbols of the RHS minus the state + independent vars.
+    dep = parsed.dependent_var
+    indep = sp.Symbol(parsed.independent_vars[0], real=True)
+    state = {sp.Symbol(dep, real=True)}
+    state |= {sp.Symbol(f"{dep}__d{k}", real=True) for k in range(1, parsed.order)}
+    params = [
+        str(s) for s in parsed.rhs_expr.free_symbols
+        if s != indep and s not in state
+    ]
+    return sorted(params)

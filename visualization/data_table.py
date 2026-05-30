@@ -30,7 +30,7 @@ class DataTableWidget(QTableWidget):
         y = solution.y
         labels = solution.labels or ["y"]
 
-        headers = ["x"] + labels
+        headers = [solution.independent or "x"] + labels
         components = y if y.ndim > 1 else y[np.newaxis, :]
 
         step = max(len(x) // max_rows, 1)

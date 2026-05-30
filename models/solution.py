@@ -37,13 +37,33 @@ class ParsedEquation:
 
 
 @dataclass
+class ParsedSystem:
+    """A system of coupled first-order ODEs.
+
+    Each state variable has one explicit derivative expression, e.g. the Lorenz
+    system has state_vars = [x, y, z] and three RHS expressions in terms of those
+    variables plus the parameters sigma, rho, beta.
+    """
+
+    raw: str
+    independent_var: str                 # shared, usually "t"
+    state_vars: list[str]                # ordered, e.g. ["x", "y", "z"]
+    rhs_exprs: list                      # sympy exprs, same order as state_vars
+    parameters: list[str]                # free symbols needing user values
+    is_linear: bool
+    classification: str
+    kind: str = "SYSTEM"
+
+
+@dataclass
 class Solution:
     """Result of a solve. Covers ODEs (single equation or system) and PDEs."""
 
-    kind: str                                  # "ODE" or "PDE"
+    kind: str                                  # "ODE" | "PDE" | "SYSTEM"
     x: np.ndarray                              # ODE: independent samples / PDE: space grid
     y: np.ndarray = field(default_factory=lambda: np.array([]))
     labels: list[str] = field(default_factory=list)
+    independent: str = "x"                     # name of the independent variable
     method: str = ""
     success: bool = True
     message: str = ""

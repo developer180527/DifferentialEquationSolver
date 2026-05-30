@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
-    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
@@ -24,38 +23,55 @@ from PySide6.QtWidgets import (
 )
 
 from models.examples import EXAMPLES
-from parser.equation_parser import ParseError, parse_equation, quick_classify
+from models.solution import ParsedSystem
+from parser.equation_parser import (
+    ParseError,
+    free_parameters,
+    parse_input,
+    quick_classify,
+)
 from solver.ode_solver import ODESolver, SolverError as ODESolverError
 from solver.pde_solver import PDESolver, SolverError as PDESolverError
+from solver.system_solver import SystemSolver, SolverError as SysSolverError
 from visualization.data_table import DataTableWidget
 from visualization.matplotlib_widget import MatplotlibWidget
-from visualization.surface_widget import SurfaceWidget
+
+# Prefer the GPU-accelerated PyVista 3D viewer; fall back to matplotlib 3D.
+try:
+    from visualization.pyvista_widget import PyVistaWidget
+    _SURFACE_CLS = PyVistaWidget
+    _HAS_PYVISTA = True
+except Exception:  # pragma: no cover - import/runtime GL issues
+    from visualization.surface_widget import SurfaceWidget
+    _SURFACE_CLS = SurfaceWidget
+    _HAS_PYVISTA = False
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-
         self.setWindowTitle("Differential Equation Solver")
         self.resize(1400, 900)
 
         self._last_solution = None
+        self.param_fields: dict[str, QLineEdit] = {}
 
         self._build_toolbar()
         self._build_ui()
 
-        # Debounced live classification as the user types.
         self._classify_timer = QTimer(self)
         self._classify_timer.setInterval(350)
         self._classify_timer.setSingleShot(True)
-        self._classify_timer.timeout.connect(self._update_detected_type)
+        self._classify_timer.timeout.connect(self._on_equation_changed)
         self.equation_input.textChanged.connect(self._classify_timer.start)
+
+        if not _HAS_PYVISTA:
+            self.log("Note: PyVista not available — using matplotlib 3D fallback.")
 
     # ------------------------------------------------------------------
     def _build_toolbar(self):
         toolbar = QToolBar("Main Toolbar")
         self.addToolBar(toolbar)
-
         toolbar.addAction("New", self.on_new)
         toolbar.addAction("Open", self.on_open)
         toolbar.addAction("Save", self.on_save)
@@ -64,11 +80,10 @@ class MainWindow(QMainWindow):
         self.examples_button = QPushButton("Examples")
         self.examples_menu = QMenu(self)
         for ex in EXAMPLES:
-            action = self.examples_menu.addAction(ex["name"])
-            action.triggered.connect(lambda checked=False, e=ex: self.load_example(e))
+            act = self.examples_menu.addAction(ex["name"])
+            act.triggered.connect(lambda checked=False, e=ex: self.load_example(e))
         self.examples_button.setMenu(self.examples_menu)
         toolbar.addWidget(self.examples_button)
-
         toolbar.addAction("Export", self.on_export)
 
     # ------------------------------------------------------------------
@@ -76,7 +91,6 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root_layout = QHBoxLayout(central)
-
         splitter = QSplitter(Qt.Horizontal)
         root_layout.addWidget(splitter)
 
@@ -88,11 +102,14 @@ class MainWindow(QMainWindow):
         equation_layout = QVBoxLayout(equation_group)
         self.equation_input = QPlainTextEdit()
         self.equation_input.setPlaceholderText(
-            "Enter an ODE or PDE here...\n"
-            "Examples:\n"
+            "Enter an ODE, PDE, or a system (one equation per line)...\n"
             "  dy/dx = y - x^2\n"
             "  y'' + 0.3*y' + y = 0\n"
-            "  du/dt = d^2u/dx^2"
+            "  du/dt = d^2u/dx^2\n"
+            "System:\n"
+            "  dx/dt = sigma*(y - x)\n"
+            "  dy/dt = x*(rho - z) - y\n"
+            "  dz/dt = x*y - beta*z"
         )
         self.equation_input.setMinimumHeight(150)
         equation_layout.addWidget(self.equation_input)
@@ -100,19 +117,15 @@ class MainWindow(QMainWindow):
 
         settings_group = QGroupBox("Solver Settings")
         settings_layout = QVBoxLayout(settings_group)
-
         self.equation_type = QComboBox()
-        self.equation_type.addItems(["Auto-detect", "ODE", "PDE"])
-
+        self.equation_type.addItems(["Auto-detect", "ODE", "PDE", "System"])
         self.method_box = QComboBox()
         self.method_box.addItems(["Auto", "RK45", "BDF", "Radau"])
-
         self.start_input = QLineEdit("0")
         self.end_input = QLineEdit("10")
-
         settings_layout.addWidget(QLabel("Equation Type"))
         settings_layout.addWidget(self.equation_type)
-        settings_layout.addWidget(QLabel("Solver Method (ODE)"))
+        settings_layout.addWidget(QLabel("Solver Method (ODE / System)"))
         settings_layout.addWidget(self.method_box)
         settings_layout.addWidget(QLabel("Domain Start"))
         settings_layout.addWidget(self.start_input)
@@ -123,21 +136,17 @@ class MainWindow(QMainWindow):
         conditions_group = QGroupBox("Conditions")
         conditions_layout = QFormLayout(conditions_group)
         self.ic_input = QLineEdit("1")
-        self.ic_input.setPlaceholderText("y(start), y'(start), ...  e.g. 0, 1")
+        self.ic_input.setPlaceholderText("comma-separated, e.g. 1, 0  or  1, 1, 1")
         self.tmax_input = QLineEdit("1.0")
         conditions_layout.addRow("Initial conditions", self.ic_input)
         conditions_layout.addRow("PDE time horizon", self.tmax_input)
         left_layout.addWidget(conditions_group)
 
-        parameters_group = QGroupBox("Parameters")
-        parameters_layout = QFormLayout(parameters_group)
-        self.param_a = QLineEdit()
-        self.param_b = QLineEdit()
-        self.param_c = QLineEdit()
-        parameters_layout.addRow("a", self.param_a)
-        parameters_layout.addRow("b", self.param_b)
-        parameters_layout.addRow("c", self.param_c)
-        left_layout.addWidget(parameters_group)
+        # ---- dynamic parameters panel ----
+        self.parameters_group = QGroupBox("Parameters")
+        self.param_form = QFormLayout(self.parameters_group)
+        left_layout.addWidget(self.parameters_group)
+        self._sync_parameter_fields([])
 
         self.detected_type_label = QLabel("Detected: —")
         self.detected_type_label.setWordWrap(True)
@@ -152,17 +161,16 @@ class MainWindow(QMainWindow):
         # ---------------- right panel ----------------
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
-
         visualization_group = QGroupBox("Visualization")
         visualization_layout = QVBoxLayout(visualization_group)
         self.visualization_tabs = QTabWidget()
 
         self.plot_widget = MatplotlibWidget()
-        self.surface_widget = SurfaceWidget()
+        self.surface_widget, surface_label = self._make_surface_widget()
         self.data_table = DataTableWidget()
 
         self.visualization_tabs.addTab(self.plot_widget, "Plot")
-        self.visualization_tabs.addTab(self.surface_widget, "Surface")
+        self.visualization_tabs.addTab(self.surface_widget, surface_label)
         self.visualization_tabs.addTab(self.data_table, "Data")
         visualization_layout.addWidget(self.visualization_tabs)
         right_layout.addWidget(visualization_group)
@@ -182,13 +190,47 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right_panel)
         splitter.setSizes([380, 1020])
 
+    # ================= dynamic parameters =================
+    def _make_surface_widget(self):
+        """Construct the 3D viewer, falling back to matplotlib if PyVista fails."""
+        if _HAS_PYVISTA:
+            try:
+                return _SURFACE_CLS(), "3D"
+            except Exception as exc:  # GL context / driver issues at runtime
+                self.log(f"3D viewer unavailable ({exc}); using matplotlib fallback.")
+        from visualization.surface_widget import SurfaceWidget
+        return SurfaceWidget(), "Surface"
+
+    def _sync_parameter_fields(self, names: list[str], values: dict | None = None):
+        """Rebuild the Parameters panel to show one field per detected parameter."""
+        preserved = {n: w.text() for n, w in self.param_fields.items()}
+        while self.param_form.rowCount():
+            self.param_form.removeRow(0)
+        self.param_fields = {}
+
+        if not names:
+            hint = QLabel("Parameters in the equation appear here automatically.")
+            hint.setStyleSheet("color: gray; font-style: italic;")
+            hint.setWordWrap(True)
+            self.param_form.addRow(hint)
+            return
+
+        for name in names:
+            field = QLineEdit()
+            if values and name in values:
+                field.setText(str(values[name]))
+            elif name in preserved:
+                field.setText(preserved[name])
+            self.param_form.addRow(name, field)
+            self.param_fields[name] = field
+
     # ================= helpers =================
     def log(self, text: str):
         self.output_log.appendPlainText(text)
 
     def _collect_params(self) -> dict:
         params = {}
-        for name, widget in (("a", self.param_a), ("b", self.param_b), ("c", self.param_c)):
+        for name, widget in self.param_fields.items():
             raw = widget.text().strip()
             if raw:
                 try:
@@ -212,32 +254,51 @@ class MainWindow(QMainWindow):
         except ValueError:
             raise ValueError("Domain start/end must be numbers.")
 
-    def _update_detected_type(self):
+    def _on_equation_changed(self):
         text = self.equation_input.toPlainText().strip()
         if not text:
             self.detected_type_label.setText("Detected: —")
+            self._sync_parameter_fields([])
             return
         self.detected_type_label.setText(f"Detected: {quick_classify(text)}")
+        try:
+            self._sync_parameter_fields(free_parameters(parse_input(text)))
+        except Exception:
+            pass  # leave fields as-is while the equation is mid-edit
 
-    # ================= actions =================
+    @staticmethod
+    def _kind(parsed) -> str:
+        return "SYSTEM" if isinstance(parsed, ParsedSystem) else parsed.kind
+
+    # ================= solve =================
     def on_solve_clicked(self):
         text = self.equation_input.toPlainText().strip()
         if not text:
             self.log("Nothing to solve — enter an equation first.")
             return
         try:
-            parsed = parse_equation(text)
+            parsed = parse_input(text)
+            kind = self._kind(parsed)
 
             forced = self.equation_type.currentText()
-            if forced == "ODE" and parsed.kind != "ODE":
-                raise ValueError("Equation looks like a PDE but type is forced to ODE.")
-            if forced == "PDE" and parsed.kind != "PDE":
-                raise ValueError("Equation looks like an ODE but type is forced to PDE.")
+            forced_map = {"ODE": "ODE", "PDE": "PDE", "System": "SYSTEM"}
+            if forced in forced_map and forced_map[forced] != kind:
+                raise ValueError(
+                    f"Equation parses as {kind} but type is forced to {forced}."
+                )
 
             self.log(f"Parsed: {parsed.classification}")
             params = self._collect_params()
 
-            if parsed.kind == "ODE":
+            if kind == "SYSTEM":
+                solution = SystemSolver().solve(
+                    parsed,
+                    domain=self._domain(),
+                    initial_conditions=self._collect_ics(),
+                    params=params,
+                    method=self.method_box.currentText(),
+                )
+            elif kind == "ODE":
                 solution = ODESolver().solve(
                     parsed,
                     domain=self._domain(),
@@ -252,10 +313,7 @@ class MainWindow(QMainWindow):
                 except ValueError:
                     t_max = 1.0
                 solution = PDESolver().solve(
-                    parsed,
-                    domain=self._domain(),
-                    coefficient=coeff,
-                    t_max=t_max,
+                    parsed, domain=self._domain(), coefficient=coeff, t_max=t_max,
                 )
 
             self._render(solution)
@@ -263,7 +321,8 @@ class MainWindow(QMainWindow):
             self.log("Diagnostics: " + json.dumps(self._jsonable(solution.diagnostics)))
             self.log("-" * 40)
 
-        except (ParseError, ValueError, ODESolverError, PDESolverError) as exc:
+        except (ParseError, ValueError, ODESolverError, PDESolverError,
+                SysSolverError) as exc:
             self.log(f"ERROR: {exc}")
         except Exception as exc:  # pragma: no cover
             self.log(f"UNEXPECTED ERROR: {exc}")
@@ -273,8 +332,11 @@ class MainWindow(QMainWindow):
         self.plot_widget.plot_solution(solution)
         self.surface_widget.plot_solution(solution)
         self.data_table.show_solution(solution)
-        # Jump to the most informative tab for this solution type.
-        self.visualization_tabs.setCurrentIndex(1 if solution.kind == "PDE" else 0)
+        # Jump to the most informative tab.
+        if solution.kind in ("PDE", "SYSTEM"):
+            self.visualization_tabs.setCurrentIndex(1)
+        else:
+            self.visualization_tabs.setCurrentIndex(0)
 
     @staticmethod
     def _jsonable(d: dict) -> dict:
@@ -288,7 +350,7 @@ class MainWindow(QMainWindow):
                 out[k] = v
         return out
 
-    # ----- examples / project IO -----
+    # ================= examples / project IO =================
     def load_example(self, ex: dict):
         self.equation_input.setPlainText(ex["equation"])
         self.equation_type.setCurrentText(ex["type"])
@@ -296,15 +358,16 @@ class MainWindow(QMainWindow):
         self.end_input.setText(str(ex["domain"][1]))
         self.ic_input.setText(ex.get("ics", ""))
         self.tmax_input.setText(str(ex.get("t_max", 1.0)))
-        p = ex.get("params", {})
-        self.param_a.setText(str(p.get("a", "")) if "a" in p else "")
-        self.param_b.setText(str(p.get("b", "")) if "b" in p else "")
-        self.param_c.setText(str(p.get("c", "")) if "c" in p else "")
+        try:
+            names = free_parameters(parse_input(ex["equation"]))
+        except Exception:
+            names = list(ex.get("params", {}).keys())
+        self._sync_parameter_fields(names, ex.get("params", {}))
         self.output_log.clear()
         self.log(f"Loaded example: {ex['name']}")
         if ex.get("note"):
             self.log(ex["note"])
-        self._update_detected_type()
+        self.detected_type_label.setText(f"Detected: {quick_classify(ex['equation'])}")
 
     def _project_state(self) -> dict:
         return {
@@ -315,17 +378,14 @@ class MainWindow(QMainWindow):
             "domain_end": self.end_input.text(),
             "ics": self.ic_input.text(),
             "t_max": self.tmax_input.text(),
-            "a": self.param_a.text(),
-            "b": self.param_b.text(),
-            "c": self.param_c.text(),
+            "params": {n: w.text() for n, w in self.param_fields.items()},
         }
 
     def on_new(self):
         self.equation_input.clear()
         self.output_log.clear()
         self.ic_input.setText("1")
-        for w in (self.param_a, self.param_b, self.param_c):
-            w.clear()
+        self._sync_parameter_fields([])
         self.detected_type_label.setText("Detected: —")
         self.log("New project.")
 
@@ -358,11 +418,16 @@ class MainWindow(QMainWindow):
             self.end_input.setText(state.get("domain_end", "10"))
             self.ic_input.setText(state.get("ics", "1"))
             self.tmax_input.setText(state.get("t_max", "1.0"))
-            self.param_a.setText(state.get("a", ""))
-            self.param_b.setText(state.get("b", ""))
-            self.param_c.setText(state.get("c", ""))
+            params = state.get("params", {})
+            try:
+                names = free_parameters(parse_input(state.get("equation", "")))
+            except Exception:
+                names = list(params.keys())
+            self._sync_parameter_fields(names, params)
             self.log(f"Opened project from {path}")
-            self._update_detected_type()
+            self.detected_type_label.setText(
+                f"Detected: {quick_classify(state.get('equation', ''))}"
+            )
         except (OSError, json.JSONDecodeError) as exc:
             self.log(f"ERROR opening: {exc}")
 
@@ -371,17 +436,21 @@ class MainWindow(QMainWindow):
             self.log("Nothing to export — solve an equation first.")
             return
         menu = QMenu(self)
-        menu.addAction("Export plot as PNG…", self._export_png)
+        menu.addAction("Export current view as PNG…", self._export_png)
         menu.addAction("Export data as CSV…", self._export_csv)
         menu.exec(self.cursor().pos())
 
     def _export_png(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export Plot", "", "PNG image (*.png)")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Image", "", "PNG image (*.png)")
         if not path:
             return
-        widget = self.surface_widget if self._last_solution.kind == "PDE" else self.plot_widget
-        widget.figure.savefig(path, dpi=150, bbox_inches="tight")
-        self.log(f"Exported plot to {path}")
+        use_surface = self._last_solution.kind in ("PDE", "SYSTEM")
+        widget = self.surface_widget if use_surface else self.plot_widget
+        try:
+            widget.export_image(path)
+            self.log(f"Exported image to {path}")
+        except Exception as exc:
+            self.log(f"ERROR exporting image: {exc}")
 
     def _export_csv(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export Data", "", "CSV file (*.csv)")

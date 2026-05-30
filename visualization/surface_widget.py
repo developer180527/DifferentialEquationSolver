@@ -83,3 +83,7 @@ class SurfaceWidget(QWidget):
         ax.set_title("Phase portrait")
         ax.grid(True, alpha=0.3)
         ax.legend(loc="best", fontsize=9)
+
+    # ------------------------------------------------------------------
+    def export_image(self, path: str):
+        self.figure.savefig(path, dpi=150, bbox_inches="tight")
